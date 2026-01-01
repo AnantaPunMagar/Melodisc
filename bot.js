@@ -1,716 +1,703 @@
-// Load environment variables from .env file
-require('dotenv').config();
+// bot.js — fully fixed: auto-join on /playlist, lazy-load, one-by-one playback
+import dotenv from "dotenv";
+dotenv.config();
 
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require('discord.js');
-const { REST } = require('@discordjs/rest');
-const { Routes } = require('discord-api-types/v9');
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
+import fs, { createReadStream, unlinkSync } from "fs";
+import path from "path";
+import { spawn } from "child_process";
+import https from "https";
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} from "discord.js";
+import {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  demuxProbe,
+  StreamType,
+} from "@discordjs/voice";
+import SpotifyWebApi from "spotify-web-api-node";
 
-// Bot configuration with proper error checking
-const config = {
-    token: process.env.DISCORD_TOKEN,
-    clientId: process.env.CLIENT_ID,
-    guildId: process.env.GUILD_ID // Optional: for guild-specific commands
-};
+// === ESM path setup ===
+import { fileURLToPath } from "url";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ytdlpPath = path.join(__dirname, "yt-dlp");
 
-// Validate required environment variables
-function validateConfig() {
-    const missing = [];
-    
-    if (!config.token) missing.push('DISCORD_TOKEN');
-    if (!config.clientId) missing.push('CLIENT_ID');
-    
-    if (missing.length > 0) {
-        console.error('❌ Missing required environment variables:');
-        missing.forEach(env => console.error(`   - ${env}`));
-        console.error('\nPlease set these environment variables and restart the bot.');
-        process.exit(1);
-    }
-    
-    // Validate token format (Discord tokens are usually 70+ characters)
-    if (config.token.length < 50) {
-        console.error('❌ Invalid DISCORD_TOKEN format. Please check your bot token.');
-        process.exit(1);
-    }
-    
-    console.log('✅ Configuration validated successfully');
-    console.log(`   - Token: ${config.token.substring(0, 10)}...`);
-    console.log(`   - Client ID: ${config.clientId}`);
-    console.log(`   - Guild ID: ${config.guildId || 'Not set (global commands)'}`);
-}
-
-// Create Discord client
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildModeration,
-        GatewayIntentBits.GuildVoiceStates
-    ]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
+  ],
 });
 
-// In-memory storage (use a database in production)
-const storage = {
-    warnings: new Map(),
-    afkUsers: new Map(),
-    autoRoles: new Map(),
-    customCommands: new Map(),
-    polls: new Map(),
-    reminderTimeouts: new Map()
+const spotifyApi = new SpotifyWebApi({
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+});
+
+const queues = new Map();
+const cookiesFile = "/home/container/cookies.txt";
+
+// === Resolve Spotify short links ===
+function resolveSpotifyLink(url) {
+  return new Promise((resolve) => {
+    if (!/^(https?:\/\/)?(spotify\.(link|app\.link))/.test(url)) {
+      return resolve(url);
+    }
+
+    const req = https.get(url, (res) => {
+      if (res.headers.location) {
+        console.log(`Resolved short link: ${url} → ${res.headers.location}`);
+        resolve(res.headers.location);
+      } else {
+        resolve(url);
+      }
+    });
+
+    req.on("error", () => resolve(url));
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve(url);
+    });
+  });
+}
+
+// === Build yt-dlp args ===
+const buildArgs = (baseArgs) => {
+  const args = [...baseArgs];
+  if (fs.existsSync(cookiesFile)) {
+    args.splice(-1, 0, "--cookies", cookiesFile);
+  }
+  return args;
 };
 
-// Slash commands definition
-const commands = [
-    // Pet Pet Command
-    new SlashCommandBuilder()
-        .setName('petpet')
-        .setDescription('Generate a pet pet GIF of a user')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to pet')
-                .setRequired(false)),
-
-    // Moderation Commands
-    new SlashCommandBuilder()
-        .setName('kick')
-        .setDescription('Kick a user from the server')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to kick')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('reason')
-                .setDescription('Reason for kick')
-                .setRequired(false))
-        .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
-
-    new SlashCommandBuilder()
-        .setName('ban')
-        .setDescription('Ban a user from the server')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to ban')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('reason')
-                .setDescription('Reason for ban')
-                .setRequired(false))
-        .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
-
-    new SlashCommandBuilder()
-        .setName('warn')
-        .setDescription('Warn a user')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to warn')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('reason')
-                .setDescription('Reason for warning')
-                .setRequired(true))
-        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
-
-    new SlashCommandBuilder()
-        .setName('warnings')
-        .setDescription('Check warnings for a user')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to check warnings for')
-                .setRequired(true))
-        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
-
-    new SlashCommandBuilder()
-        .setName('clear')
-        .setDescription('Clear messages from a channel')
-        .addIntegerOption(option => 
-            option.setName('amount')
-                .setDescription('Number of messages to clear (1-100)')
-                .setRequired(true)
-                .setMinValue(1)
-                .setMaxValue(100))
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
-
-    // Fun Commands
-    new SlashCommandBuilder()
-        .setName('avatar')
-        .setDescription('Get user avatar')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to get avatar of')
-                .setRequired(false)),
-
-    new SlashCommandBuilder()
-        .setName('userinfo')
-        .setDescription('Get information about a user')
-        .addUserOption(option => 
-            option.setName('user')
-                .setDescription('User to get info about')
-                .setRequired(false)),
-
-    new SlashCommandBuilder()
-        .setName('serverinfo')
-        .setDescription('Get server information'),
-
-    new SlashCommandBuilder()
-        .setName('poll')
-        .setDescription('Create a poll')
-        .addStringOption(option => 
-            option.setName('question')
-                .setDescription('Poll question')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('options')
-                .setDescription('Poll options separated by commas')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('remind')
-        .setDescription('Set a reminder')
-        .addStringOption(option => 
-            option.setName('time')
-                .setDescription('Time (e.g., 5m, 1h, 2d)')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('message')
-                .setDescription('Reminder message')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('afk')
-        .setDescription('Set AFK status')
-        .addStringOption(option => 
-            option.setName('reason')
-                .setDescription('AFK reason')
-                .setRequired(false)),
-
-    new SlashCommandBuilder()
-        .setName('meme')
-        .setDescription('Get a random meme'),
-
-    new SlashCommandBuilder()
-        .setName('joke')
-        .setDescription('Get a random joke'),
-
-    new SlashCommandBuilder()
-        .setName('8ball')
-        .setDescription('Ask the magic 8-ball a question')
-        .addStringOption(option => 
-            option.setName('question')
-                .setDescription('Your question')
-                .setRequired(true)),
-
-    // Utility Commands
-    new SlashCommandBuilder()
-        .setName('weather')
-        .setDescription('Get weather information')
-        .addStringOption(option => 
-            option.setName('location')
-                .setDescription('Location to get weather for')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('translate')
-        .setDescription('Translate text')
-        .addStringOption(option => 
-            option.setName('text')
-                .setDescription('Text to translate')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('to')
-                .setDescription('Language to translate to')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('qr')
-        .setDescription('Generate QR code')
-        .addStringOption(option => 
-            option.setName('text')
-                .setDescription('Text to encode')
-                .setRequired(true)),
-
-    // Music Commands (basic)
-    new SlashCommandBuilder()
-        .setName('play')
-        .setDescription('Play music (placeholder)')
-        .addStringOption(option => 
-            option.setName('song')
-                .setDescription('Song to play')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Stop music'),
-
-    // Economy Commands (basic)
-    new SlashCommandBuilder()
-        .setName('balance')
-        .setDescription('Check your balance'),
-
-    new SlashCommandBuilder()
-        .setName('daily')
-        .setDescription('Claim daily reward'),
-
-    // Custom Commands
-    new SlashCommandBuilder()
-        .setName('addcmd')
-        .setDescription('Add a custom command')
-        .addStringOption(option => 
-            option.setName('name')
-                .setDescription('Command name')
-                .setRequired(true))
-        .addStringOption(option => 
-            option.setName('response')
-                .setDescription('Command response')
-                .setRequired(true))
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
-    new SlashCommandBuilder()
-        .setName('help')
-        .setDescription('Show bot commands and features')
-];
-
-// Alternative petpet implementation using external API
-async function generatePetPetGif(avatarUrl) {
-    try {
-        // Use external API for petpet generation
-        const petpetUrl = `https://api.waifu.pics/sfw/pat`;
-        const response = await axios.get(petpetUrl);
-        
-        return {
-            success: true,
-            message: "Pet pet! 🤗",
-            avatarUrl: avatarUrl
-        };
-    } catch (error) {
-        console.error('Error generating pet pet:', error);
-        return {
-            success: false,
-            message: "Failed to generate pet pet!"
-        };
-    }
-}
-
-// Event handlers
-client.once('ready', () => {
-    console.log(`✅ Bot is ready! Logged in as ${client.user.tag}`);
-    client.user.setActivity('with Discord API', { type: 'PLAYING' });
-});
-
-// Error handling for the client
-client.on('error', (error) => {
-    console.error('❌ Discord client error:', error);
-});
-
-client.on('warn', (warning) => {
-    console.warn('⚠️ Discord client warning:', warning);
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (error) => {
-    console.error('❌ Unhandled promise rejection:', error);
-});
-
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-
-    const { commandName, options, user, guild, channel } = interaction;
-
-    try {
-        switch (commandName) {
-            case 'petpet':
-                await interaction.deferReply();
-                const targetUser = options.getUser('user') || user;
-                const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 128 });
-                
-                const petResult = await generatePetPetGif(avatarUrl);
-                
-                if (petResult.success) {
-                    const petEmbed = new EmbedBuilder()
-                        .setTitle(`${user.displayName} pets ${targetUser.displayName}!`)
-                        .setDescription("*Pat pat pat* 🤗")
-                        .setImage(avatarUrl)
-                        .setColor('#FFB6C1')
-                        .setFooter({ text: 'Pet pet! So cute!' });
-                    
-                    await interaction.editReply({ embeds: [petEmbed] });
-                } else {
-                    await interaction.editReply('❌ Failed to generate pet pet!');
-                }
-                break;
-
-            case 'kick':
-                const kickUser = options.getUser('user');
-                const kickReason = options.getString('reason') || 'No reason provided';
-                
-                try {
-                    const kickMember = await guild.members.fetch(kickUser.id);
-                    
-                    if (kickMember.kickable) {
-                        await kickMember.kick(kickReason);
-                        await interaction.reply(`✅ ${kickUser.tag} has been kicked. Reason: ${kickReason}`);
-                    } else {
-                        await interaction.reply('❌ Cannot kick this user (insufficient permissions or higher role).');
-                    }
-                } catch (error) {
-                    await interaction.reply('❌ Failed to kick user. They may not be in the server.');
-                }
-                break;
-
-            case 'ban':
-                const banUser = options.getUser('user');
-                const banReason = options.getString('reason') || 'No reason provided';
-                
-                try {
-                    const banMember = await guild.members.fetch(banUser.id);
-                    
-                    if (banMember.bannable) {
-                        await banMember.ban({ reason: banReason });
-                        await interaction.reply(`✅ ${banUser.tag} has been banned. Reason: ${banReason}`);
-                    } else {
-                        await interaction.reply('❌ Cannot ban this user (insufficient permissions or higher role).');
-                    }
-                } catch (error) {
-                    await interaction.reply('❌ Failed to ban user. They may not be in the server.');
-                }
-                break;
-
-            case 'warn':
-                const warnUser = options.getUser('user');
-                const warnReason = options.getString('reason');
-                
-                if (!storage.warnings.has(warnUser.id)) {
-                    storage.warnings.set(warnUser.id, []);
-                }
-                
-                storage.warnings.get(warnUser.id).push({
-                    reason: warnReason,
-                    moderator: user.id,
-                    timestamp: Date.now()
-                });
-                
-                await interaction.reply(`⚠️ ${warnUser.tag} has been warned. Reason: ${warnReason}`);
-                break;
-
-            case 'warnings':
-                const checkUser = options.getUser('user');
-                const warnings = storage.warnings.get(checkUser.id) || [];
-                
-                const embed = new EmbedBuilder()
-                    .setTitle(`Warnings for ${checkUser.tag}`)
-                    .setColor('#ffcc00')
-                    .setDescription(warnings.length === 0 ? 'No warnings' : 
-                        warnings.map((w, i) => `${i + 1}. ${w.reason} - <@${w.moderator}>`).join('\n'));
-                
-                await interaction.reply({ embeds: [embed] });
-                break;
-
-            case 'clear':
-                const amount = options.getInteger('amount');
-                try {
-                    const messages = await channel.bulkDelete(amount, true);
-                    await interaction.reply(`✅ Cleared ${messages.size} messages.`);
-                } catch (error) {
-                    await interaction.reply('❌ Failed to clear messages. Messages may be too old (>14 days).');
-                }
-                break;
-
-            case 'avatar':
-                const avatarUser = options.getUser('user') || user;
-                const avatarEmbed = new EmbedBuilder()
-                    .setTitle(`${avatarUser.tag}'s Avatar`)
-                    .setImage(avatarUser.displayAvatarURL({ size: 512 }))
-                    .setColor('#5865F2');
-                
-                await interaction.reply({ embeds: [avatarEmbed] });
-                break;
-
-            case 'userinfo':
-                const infoUser = options.getUser('user') || user;
-                const member = await guild.members.fetch(infoUser.id);
-                
-                const userEmbed = new EmbedBuilder()
-                    .setTitle(`User Info: ${infoUser.tag}`)
-                    .setThumbnail(infoUser.displayAvatarURL())
-                    .addFields(
-                        { name: 'ID', value: infoUser.id, inline: true },
-                        { name: 'Created', value: `<t:${Math.floor(infoUser.createdTimestamp / 1000)}:R>`, inline: true },
-                        { name: 'Joined', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
-                        { name: 'Roles', value: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.toString()).join(', ') || 'None' }
-                    )
-                    .setColor('#5865F2');
-                
-                await interaction.reply({ embeds: [userEmbed] });
-                break;
-
-            case 'serverinfo':
-                const serverEmbed = new EmbedBuilder()
-                    .setTitle(guild.name)
-                    .setThumbnail(guild.iconURL())
-                    .addFields(
-                        { name: 'Members', value: guild.memberCount.toString(), inline: true },
-                        { name: 'Channels', value: guild.channels.cache.size.toString(), inline: true },
-                        { name: 'Roles', value: guild.roles.cache.size.toString(), inline: true },
-                        { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true }
-                    )
-                    .setColor('#5865F2');
-                
-                await interaction.reply({ embeds: [serverEmbed] });
-                break;
-
-            case 'poll':
-                const question = options.getString('question');
-                const pollOptions = options.getString('options').split(',').map(o => o.trim());
-                
-                if (pollOptions.length < 2 || pollOptions.length > 10) {
-                    await interaction.reply('❌ Poll must have 2-10 options.');
-                    return;
-                }
-                
-                const pollEmbed = new EmbedBuilder()
-                    .setTitle(`📊 ${question}`)
-                    .setDescription(pollOptions.map((opt, i) => `${i + 1}️⃣ ${opt}`).join('\n'))
-                    .setColor('#5865F2');
-                
-                const pollMessage = await interaction.reply({ embeds: [pollEmbed], fetchReply: true });
-                
-                for (let i = 0; i < pollOptions.length; i++) {
-                    await pollMessage.react(`${i + 1}️⃣`);
-                }
-                break;
-
-            case 'remind':
-                const timeStr = options.getString('time');
-                const message = options.getString('message');
-                
-                const timeMs = parseTime(timeStr);
-                if (!timeMs) {
-                    await interaction.reply('❌ Invalid time format. Use format like: 5m, 1h, 2d');
-                    return;
-                }
-                
-                await interaction.reply(`⏰ Reminder set for ${timeStr}!`);
-                
-                setTimeout(() => {
-                    interaction.followUp(`🔔 Reminder: ${message}`);
-                }, timeMs);
-                break;
-
-            case 'afk':
-                const afkReason = options.getString('reason') || 'AFK';
-                storage.afkUsers.set(user.id, { reason: afkReason, timestamp: Date.now() });
-                await interaction.reply(`😴 You are now AFK: ${afkReason}`);
-                break;
-
-            case 'meme':
-                await interaction.deferReply();
-                try {
-                    const memeResponse = await axios.get('https://meme-api.com/gimme');
-                    const memeEmbed = new EmbedBuilder()
-                        .setTitle(memeResponse.data.title)
-                        .setImage(memeResponse.data.url)
-                        .setColor('#ff6b6b');
-                    
-                    await interaction.editReply({ embeds: [memeEmbed] });
-                } catch (error) {
-                    await interaction.editReply('❌ Failed to fetch meme!');
-                }
-                break;
-
-            case 'joke':
-                const jokes = [
-                    "Why don't scientists trust atoms? Because they make up everything!",
-                    "Why did the scarecrow win an award? He was outstanding in his field!",
-                    "Why don't eggs tell jokes? They'd crack each other up!",
-                    "What do you call a fake noodle? An impasta!",
-                    "Why did the math book look so sad? Because it had too many problems!"
-                ];
-                
-                await interaction.reply(jokes[Math.floor(Math.random() * jokes.length)]);
-                break;
-
-            case '8ball':
-                const ballQuestion = options.getString('question');
-                const responses = [
-                    "It is certain", "Reply hazy, try again", "Don't count on it",
-                    "It is decidedly so", "Ask again later", "My reply is no",
-                    "Without a doubt", "Better not tell you now", "My sources say no",
-                    "Yes definitely", "Cannot predict now", "Outlook not so good",
-                    "You may rely on it", "Concentrate and ask again", "Very doubtful"
-                ];
-                
-                const response = responses[Math.floor(Math.random() * responses.length)];
-                await interaction.reply(`🎱 **${ballQuestion}**\n${response}`);
-                break;
-
-            case 'help':
-                const helpEmbed = new EmbedBuilder()
-                    .setTitle('🤖 Bot Commands')
-                    .setDescription('Here are all available commands:')
-                    .addFields(
-                        { name: '🎨 Fun Commands', value: '`/petpet` `/avatar` `/userinfo` `/serverinfo` `/poll` `/meme` `/joke` `/8ball`' },
-                        { name: '🛡️ Moderation', value: '`/kick` `/ban` `/warn` `/warnings` `/clear`' },
-                        { name: '🔧 Utility', value: '`/remind` `/afk` `/weather` `/translate` `/qr`' },
-                        { name: '🎵 Music', value: '`/play` `/stop` (Basic implementation)' },
-                        { name: '💰 Economy', value: '`/balance` `/daily` (Basic implementation)' },
-                        { name: '⚙️ Custom', value: '`/addcmd` (Add custom commands)' }
-                    )
-                    .setColor('#5865F2')
-                    .setFooter({ text: 'Made with ❤️ using Discord.js' });
-                
-                await interaction.reply({ embeds: [helpEmbed] });
-                break;
-
-            default:
-                // Check for custom commands
-                if (storage.customCommands.has(commandName)) {
-                    await interaction.reply(storage.customCommands.get(commandName));
-                } else {
-                    await interaction.reply('❌ Command not implemented yet!');
-                }
-        }
-    } catch (error) {
-        console.error('❌ Error handling command:', error);
-        const errorMessage = '❌ An error occurred while executing this command.';
-        
-        if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ content: errorMessage, ephemeral: true });
-        } else if (interaction.deferred) {
-            await interaction.editReply(errorMessage);
-        } else {
-            await interaction.followUp({ content: errorMessage, ephemeral: true });
-        }
-    }
-});
-
-// Message handler for AFK system
-client.on('messageCreate', (message) => {
-    if (message.author.bot) return;
-    
-    // Check if user is AFK and remove status
-    if (storage.afkUsers.has(message.author.id)) {
-        storage.afkUsers.delete(message.author.id);
-        message.reply('👋 Welcome back! Your AFK status has been removed.');
-    }
-    
-    // Check if mentioned users are AFK
-    message.mentions.users.forEach(user => {
-        if (storage.afkUsers.has(user.id)) {
-            const afkData = storage.afkUsers.get(user.id);
-            message.reply(`💤 ${user.tag} is AFK: ${afkData.reason}`);
-        }
+// === Extract metadata (for direct URLs) ===
+const extractMetadata = async (url) => {
+  console.log(`Extracting metadata for: ${url}`);
+  return new Promise((resolve, reject) => {
+    const baseArgs = [
+      "--no-check-certificates",
+      "--user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "--print",
+      "%(title)s|%(webpage_url)s",
+      url,
+    ];
+    const args = buildArgs(baseArgs);
+    const process = spawn(ytdlpPath, args);
+    let output = "";
+    let stderr = "";
+    process.stdout.on("data", (data) => (output += data.toString()));
+    process.stderr.on("data", (data) => (stderr += data.toString()));
+    process.on("close", (code) => {
+      if (code === 0 && output.trim()) {
+        const [title, webpageUrl] = output.trim().split("|");
+        resolve({ title: title.trim(), url: webpageUrl.trim() || url });
+      } else {
+        console.error(`Metadata extraction failed: code ${code}, stderr: ${stderr}`);
+        reject(new Error(`Metadata extraction failed: code ${code}`));
+      }
     });
-});
+  });
+};
 
-// Utility functions
-function parseTime(timeStr) {
-    const matches = timeStr.match(/^(\d+)([smhd])$/);
-    if (!matches) return null;
-    
-    const value = parseInt(matches[1]);
-    const unit = matches[2];
-    
-    switch (unit) {
-        case 's': return value * 1000;
-        case 'm': return value * 60 * 1000;
-        case 'h': return value * 60 * 60 * 1000;
-        case 'd': return value * 24 * 60 * 60 * 1000;
-        default: return null;
-    }
-}
-
-// Deploy commands with better error handling
-async function deployCommands() {
-    if (!config.token || !config.clientId) {
-        console.error('❌ Cannot deploy commands: Missing token or client ID');
-        return false;
-    }
-
-    const rest = new REST({ version: '9' }).setToken(config.token);
-    
-    try {
-        console.log('🔄 Started refreshing application (/) commands.');
-        
-        if (config.guildId) {
-            // Deploy to specific guild (faster for development)
-            await rest.put(
-                Routes.applicationGuildCommands(config.clientId, config.guildId),
-                { body: commands }
-            );
-            console.log(`✅ Successfully deployed commands to guild ${config.guildId}`);
+// === YouTube search fallback ===
+const fallbackSearch = async (searchQuery) => {
+  console.log(`Searching YouTube via yt-dlp for: ${searchQuery}`);
+  return new Promise((resolve, reject) => {
+    const ytSearch = `ytsearch1:${searchQuery}`;
+    const baseArgs = [
+      "--flat-playlist",
+      "--no-check-certificates",
+      "--user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "--print",
+      "%(title)s|%(id)s",
+      "--playlist-end",
+      "1",
+      ytSearch,
+    ];
+    const args = buildArgs(baseArgs);
+    const process = spawn(ytdlpPath, args);
+    let output = "";
+    let stderr = "";
+    process.stdout.on("data", (data) => (output += data.toString()));
+    process.stderr.on("data", (data) => (stderr += data.toString()));
+    process.on("close", (code) => {
+      if (code === 0 && output.trim()) {
+        const [title, videoId] = output.trim().split("|");
+        if (title && /^[a-zA-Z0-9_-]{11}$/.test(videoId?.trim())) {
+          resolve({
+            title: title.trim(),
+            url: `https://www.youtube.com/watch?v=${videoId.trim()}`,
+          });
         } else {
-            // Deploy globally (takes up to 1 hour)
-            await rest.put(
-                Routes.applicationCommands(config.clientId),
-                { body: commands }
-            );
-            console.log('✅ Successfully deployed commands globally');
+          reject(new Error("No valid video results"));
         }
-        
-        return true;
-    } catch (error) {
-        console.error('❌ Error deploying commands:', error);
-        
-        if (error.code === 'TokenInvalid') {
-            console.error('🔑 Your Discord token is invalid. Please check your DISCORD_TOKEN environment variable.');
-        } else if (error.code === 50001) {
-            console.error('🔑 Missing access. Check your bot permissions and token.');
-        } else if (error.status === 401) {
-            console.error('🔑 Unauthorized. Your bot token may be invalid or expired.');
-        }
-        
-        return false;
+      } else {
+        console.error(`Search failed: code ${code}, stderr: ${stderr}`);
+        reject(new Error("Search failed"));
+      }
+    });
+  });
+};
+
+// === Spotify playlist fetch ===
+async function getSpotifyPlaylistTracks(playlistId) {
+  let tracks = [];
+  let offset = 0;
+  const limit = 100;
+  try {
+    while (true) {
+      const response = await spotifyApi.getPlaylistTracks(playlistId, { limit, offset });
+      if (!response.body?.items) throw new Error("Invalid Spotify response");
+      tracks = tracks.concat(response.body.items.map((item) => item.track));
+      if (response.body.items.length < limit) break;
+      offset += limit;
     }
+    return tracks;
+  } catch (error) {
+    console.error(`Error fetching playlist tracks: ${error.message}`);
+    throw error;
+  }
 }
 
-// Start the bot with proper error handling
-async function startBot() {
+// === Utilities ===
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeUnlink(p) {
+  try {
+    if (p && fs.existsSync(p)) unlinkSync(p);
+  } catch (e) {
+    console.warn("Failed to unlink:", p, e.message);
+  }
+}
+
+// === Discord Events ===
+client.once(Events.ClientReady, () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  client.user.setActivity("Music!", { type: 2 });
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const guildId = interaction.guild.id;
+  let serverQueue = queues.get(guildId);
+  if (!serverQueue) {
+    serverQueue = {
+      queue: [],
+      nowPlaying: null,
+      loop: "off",
+      connection: null,
+      player: null,
+      currentTempFile: null,
+    };
+    queues.set(guildId, serverQueue);
+  }
+
+  const commandName = interaction.commandName;
+
+  if (commandName === "join") {
+    if (!interaction.member.voice.channel)
+      return interaction.reply("You are not in a voice channel!");
+    const connection = joinVoiceChannel({
+      channelId: interaction.member.voice.channel.id,
+      guildId,
+      adapterCreator: interaction.guild.voiceAdapterCreator,
+    });
+    serverQueue.connection = connection;
+    if (!serverQueue.player) {
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+      serverQueue.player = player;
+      player.on("error", (err) => console.error("Audio player error:", err));
+    }
+    await interaction.reply(`Joined ${interaction.member.voice.channel.name}`);
+  } else if (commandName === "leave") {
+    if (serverQueue.connection) {
+      try { serverQueue.connection.destroy(); } catch (e) {}
+      queues.delete(guildId);
+      await interaction.reply("Left the voice channel");
+    } else {
+      await interaction.reply("I'm not in a voice channel!");
+    }
+  } else if (commandName === "play") {
+    if (!interaction.member.voice.channel)
+      return interaction.reply("You are not in a voice channel!");
+    if (!serverQueue.connection) {
+      const connection = joinVoiceChannel({
+        channelId: interaction.member.voice.channel.id,
+        guildId,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
+      });
+      serverQueue.connection = connection;
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+      serverQueue.player = player;
+      player.on("error", (err) => console.error("Player error:", err));
+    }
+
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.deferReply().catch(() => {});
+    }
+
+    let query = interaction.options.getString("query");
+    console.log(`Processing /play: ${query}`);
+
+    let actualQuery = query.toLowerCase().startsWith("url:") ? query.substring(4).trim() : query.trim();
+
+    if (/^(https?:\/\/)?(spotify\.(link|app\.link))/.test(actualQuery)) {
+      actualQuery = await resolveSpotifyLink(actualQuery);
+    }
+
+    // Handle Spotify playlist in /play
+    const playlistMatch = actualQuery.match(/^https?:\/\/(?:open\.)?spotify\.com\/playlist\/([a-zA-Z0-9]+)/);
+    if (playlistMatch) {
+      const playlistId = playlistMatch[1];
+      try {
+        await spotifyApi.clientCredentialsGrant().then((data) =>
+          spotifyApi.setAccessToken(data.body["access_token"])
+        );
+        const tracks = await getSpotifyPlaylistTracks(playlistId);
+
+        let addedCount = 0;
+        for (const track of tracks) {
+          if (track && track.name && track.artists?.[0]?.name) {
+            serverQueue.queue.push({
+              type: 'spotify',
+              artist: track.artists[0].name,
+              title: track.name
+            });
+            addedCount++;
+          }
+        }
+
+        const replyText = `✅ Added ${addedCount} tracks from playlist to queue.`;
+        interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+
+        if (serverQueue.player?.state.status === AudioPlayerStatus.Idle) {
+          playSong(guildId, interaction.channel);
+        }
+        return;
+      } catch (error) {
+        console.error(`Playlist error: ${error.message}`);
+        const replyText = `Error: ${error.message}`;
+        interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+        return;
+      }
+    }
+
+    // Handle single Spotify track
+    const trackMatch = actualQuery.match(/^https?:\/\/(?:open\.)?spotify\.com\/track\/([a-zA-Z0-9]+)/);
+    if (trackMatch) {
+      try {
+        await spotifyApi.clientCredentialsGrant().then((data) =>
+          spotifyApi.setAccessToken(data.body["access_token"])
+        );
+        const trackId = trackMatch[1];
+        const { body: track } = await spotifyApi.getTrack(trackId);
+        serverQueue.queue.push({
+          type: 'spotify',
+          artist: track.artists[0].name,
+          title: track.name
+        });
+      } catch (err) {
+        console.error("Spotify track error:", err);
+        const replyText = `Error fetching Spotify track: ${err.message}`;
+        interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+        return;
+      }
+    } else if (/^https?:\/\//.test(actualQuery)) {
+      try {
+        const song = await extractMetadata(actualQuery);
+        serverQueue.queue.push(song);
+      } catch (err) {
+        console.error("Direct URL error:", err);
+        const replyText = `Error: ${err.message}`;
+        interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+        return;
+      }
+    } else {
+      try {
+        const song = await fallbackSearch(actualQuery);
+        serverQueue.queue.push(song);
+      } catch (err) {
+        console.error("Search error:", err);
+        const replyText = `No results found for: ${actualQuery}`;
+        interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+        return;
+      }
+    }
+
+    const replyText = `Added to queue: ${serverQueue.queue[serverQueue.queue.length - 1]?.title || 'song'}`;
+    interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+
+    if (serverQueue.player?.state.status === AudioPlayerStatus.Idle) {
+      playSong(guildId, interaction.channel);
+    }
+  } else if (commandName === "playlist") {
+    // ✅ Ensure user is in a voice channel
+    if (!interaction.member.voice.channel) {
+      return interaction.reply("You must be in a voice channel to use /playlist!");
+    }
+
+    let url = interaction.options.getString("url").trim();
+    console.log(`Raw playlist URL: "${url}"`);
+
+    if (/^(https?:\/\/)?(spotify\.(link|app\.link))/.test(url)) {
+      url = await resolveSpotifyLink(url);
+      console.log(`Resolved to: "${url}"`);
+    }
+
+    const playlistMatch = url.match(/^https?:\/\/(?:open\.)?spotify\.com\/playlist\/([a-zA-Z0-9]+)/);
+    if (!playlistMatch) {
+      return interaction.reply("Provide a valid Spotify playlist URL.");
+    }
+
+    const playlistId = playlistMatch[1];
+
+    // ✅ Auto-join voice channel if needed
+    if (!serverQueue.connection) {
+      const connection = joinVoiceChannel({
+        channelId: interaction.member.voice.channel.id,
+        guildId,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
+      });
+      serverQueue.connection = connection;
+
+      if (!serverQueue.player) {
+        const player = createAudioPlayer();
+        connection.subscribe(player);
+        serverQueue.player = player;
+        player.on("error", (err) => console.error("Audio player error:", err));
+      }
+    }
+
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.deferReply().catch(() => {});
+    }
+
     try {
-        // Validate configuration first
-        validateConfig();
-        
-        // Deploy commands
-        const deploySuccess = await deployCommands();
-        if (!deploySuccess) {
-            console.error('❌ Failed to deploy commands. Bot will not start.');
-            process.exit(1);
+      await spotifyApi.clientCredentialsGrant().then((data) =>
+        spotifyApi.setAccessToken(data.body["access_token"])
+      );
+      const tracks = await getSpotifyPlaylistTracks(playlistId);
+
+      let addedCount = 0;
+      for (const track of tracks) {
+        if (track && track.name && track.artists?.[0]?.name) {
+          serverQueue.queue.push({
+            type: 'spotify',
+            artist: track.artists[0].name,
+            title: track.name
+          });
+          addedCount++;
         }
-        
-        // Login to Discord
-        console.log('🔑 Logging in to Discord...');
-        await client.login(config.token);
-        
+      }
+
+      const replyText = `✅ Added ${addedCount} tracks from playlist to queue.`;
+      interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
+
+      // ✅ Start playback if idle
+      if (serverQueue.player?.state.status === AudioPlayerStatus.Idle) {
+        playSong(guildId, interaction.channel);
+      }
     } catch (error) {
-        console.error('❌ Failed to start bot:', error);
-        
-        if (error.code === 'TokenInvalid') {
-            console.error('🔑 Invalid token provided. Please check your DISCORD_TOKEN environment variable.');
-        } else if (error.code === 'DisallowedIntents') {
-            console.error('🔑 Disallowed intents. Please enable the required intents in the Discord Developer Portal.');
-        }
-        
-        process.exit(1);
+      console.error(`Playlist error: ${error.message}`);
+      const replyText = `Error: ${error.message}`;
+      interaction.deferred ? await interaction.followUp(replyText) : await interaction.reply(replyText);
     }
+  } else if (commandName === "loop") {
+    const mode = interaction.options.getString("mode");
+    if (!["off", "single", "queue"].includes(mode))
+      return interaction.reply("Invalid mode: off, single, or queue.");
+    serverQueue.loop = mode;
+    await interaction.reply(`Loop mode set to: ${mode}`);
+  } else if (commandName === "stop") {
+    if (serverQueue.player) {
+      serverQueue.player.stop();
+      serverQueue.queue = [];
+      serverQueue.nowPlaying = null;
+      await interaction.reply("Stopped playing and cleared the queue.");
+    } else {
+      await interaction.reply("Nothing is playing!");
+    }
+  } else if (commandName === "pause") {
+    if (serverQueue.player?.state.status === AudioPlayerStatus.Playing) {
+      serverQueue.player.pause();
+      await interaction.reply("Paused");
+    } else {
+      await interaction.reply("Nothing is playing!");
+    }
+  } else if (commandName === "resume") {
+    if (serverQueue.player?.state.status === AudioPlayerStatus.Paused) {
+      serverQueue.player.unpause();
+      await interaction.reply("Resumed");
+    } else {
+      await interaction.reply("Not paused!");
+    }
+  } else if (commandName === "skip") {
+    if (serverQueue.player) {
+      serverQueue.player.stop();
+      await interaction.reply("Skipped to next song");
+    } else {
+      await interaction.reply("Nothing is playing!");
+    }
+  } else if (commandName === "queue") {
+    if (serverQueue.queue.length === 0) {
+      const msg = serverQueue.nowPlaying
+        ? `Now Playing: ${serverQueue.nowPlaying.title}\nQueue is empty!`
+        : "Queue is empty!";
+      return interaction.reply(msg);
+    }
+    const now = serverQueue.nowPlaying ? `Now Playing: ${serverQueue.nowPlaying.title}\n\n` : "";
+    const list = serverQueue.queue.map((s, i) => `${i + 1}. ${s.title || `${s.artist} - ${s.title}`}`).join("\n");
+    await interaction.reply(`${now}Current queue:\n${list}`);
+  }
+});
+
+// === Play Song — resolves Spotify tracks on-demand ===
+async function playSong(guildId, channel) {
+  console.log("▶️ playSong called for guild:", guildId); // debug log
+
+  const serverQueue = queues.get(guildId);
+  if (!serverQueue || serverQueue.queue.length === 0) {
+    try { serverQueue?.player?.stop(); } catch (e) {}
+    serverQueue.nowPlaying = null;
+    return channel.send("Queue is empty! Stopping playback.");
+  }
+
+  if (!serverQueue.player) {
+    console.error("No player for this server.");
+    return channel.send("Playback error: audio player missing.");
+  }
+
+  let song = serverQueue.queue[0];
+
+  if (song.type === 'spotify') {
+    const searchQuery = `${song.artist} ${song.title}`;
+    try {
+      console.log(`🔍 Searching YouTube for: ${searchQuery}`);
+      const ytSong = await fallbackSearch(searchQuery);
+      serverQueue.queue[0] = ytSong;
+      song = ytSong;
+    } catch (err) {
+      console.error(`❌ Failed to find on YouTube: ${searchQuery}`);
+      await channel.send(`❌ Skipped: "${searchQuery}" (not found on YouTube)`);
+      serverQueue.queue.shift();
+      return playSong(guildId, channel);
+    }
+  }
+
+  serverQueue.nowPlaying = song;
+
+  const tempDir = path.resolve("./temp");
+  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+  const tempFileBase = path.join(tempDir, `audio_${guildId}_${Date.now()}`);
+  const maxRetries = 3;
+  let retries = 0;
+  let actualTempFile = null;
+
+  console.log(`▶️ Attempting to download and play: ${song.title} (${song.url})`);
+  const hasCookies = fs.existsSync(cookiesFile);
+  console.log(`Using ${hasCookies ? "cookies" : "no cookies"}`);
+
+  while (retries < maxRetries) {
+    try {
+      const baseArgs = [
+        "-f", "bestaudio[ext=opus]/bestaudio",
+        "--audio-quality", "0",
+        "--no-playlist",
+        "--no-check-certificates",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "-o", `${tempFileBase}.%(ext)s`,
+        song.url,
+      ];
+      const args = buildArgs(baseArgs);
+      const process = spawn(ytdlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+      let stderr = "";
+      process.stderr.on("data", (d) => {
+        const msg = d.toString();
+        stderr += msg;
+        if (!(msg.includes("Signature extraction failed") || msg.includes("SABR"))) {
+          console.error(`yt-dlp stderr: ${msg}`);
+        }
+      });
+
+      await new Promise((resolve, reject) => {
+        process.on("error", reject);
+        process.on("close", (code) => {
+          if (code !== 0) {
+            console.error(`Download failed: code ${code}, stderr: ${stderr}`);
+            if (stderr.includes("Sign in to confirm") || stderr.toLowerCase().includes("bot")) {
+              reject(new Error("Anti-bot restriction detected"));
+            } else {
+              reject(new Error(`yt-dlp exited with code ${code}`));
+            }
+          } else resolve();
+        });
+      });
+
+      const dir = path.dirname(tempFileBase);
+      const files = fs.readdirSync(dir).filter((f) => f.startsWith(path.basename(tempFileBase)));
+      if (files.length === 0) throw new Error("No file downloaded");
+      actualTempFile = path.join(dir, files[0]);
+
+      const stats = fs.statSync(actualTempFile);
+      if (stats.size < 1024) throw new Error("Downloaded file too small");
+
+      console.log(`📥 Downloaded to ${actualTempFile}, size: ${stats.size}`);
+      serverQueue.currentTempFile = actualTempFile;
+      break;
+    } catch (err) {
+      console.error(`Download attempt ${retries + 1} failed:`, err.message);
+      if (err.message.includes("Anti-bot restriction")) {
+        await channel.send(`🚫 Cannot play "${song.title}" due to YouTube restrictions. Skipping...`);
+        serverQueue.queue.shift();
+        serverQueue.nowPlaying = null;
+        safeUnlink(actualTempFile);
+        if (serverQueue.queue.length > 0) return playSong(guildId, channel);
+        return serverQueue.player.stop();
+      }
+      retries++;
+      if (retries >= maxRetries) {
+        await channel.send(`⚠️ Failed to download "${song.title}" after ${maxRetries} attempts. Skipping...`);
+        serverQueue.queue.shift();
+        serverQueue.nowPlaying = null;
+        safeUnlink(actualTempFile);
+        if (serverQueue.queue.length > 0) return playSong(guildId, channel);
+        return serverQueue.player.stop();
+      }
+      await wait(2000);
+    }
+  }
+
+  // Play audio
+  let resource;
+  try {
+    let input = createReadStream(actualTempFile);
+    const { stream: probedStream, type } = await demuxProbe(input);
+    resource = createAudioResource(probedStream, { inputType: type });
+  } catch (probeErr) {
+    console.warn(`demuxProbe failed, falling back to Arbitrary: ${probeErr.message}`);
+    const input = createReadStream(actualTempFile);
+    resource = createAudioResource(input, { inputType: StreamType.Arbitrary });
+  }
+
+  serverQueue.player.play(resource);
+
+  // Event handlers
+  const onIdle = async () => {
+    const tempFile = serverQueue.currentTempFile;
+    serverQueue.currentTempFile = null;
+    safeUnlink(tempFile);
+
+    if (serverQueue.loop === "single") {
+      await channel.send(`🔂 Now playing: ${serverQueue.nowPlaying.title}`);
+      return playSong(guildId, channel);
+    } else if (serverQueue.loop === "queue") {
+      const currentSong = serverQueue.queue.shift();
+      serverQueue.nowPlaying = null;
+      serverQueue.queue.push(currentSong);
+      return playSong(guildId, channel);
+    } else {
+      serverQueue.queue.shift();
+      serverQueue.nowPlaying = null;
+      if (serverQueue.queue.length > 0) return playSong(guildId, channel);
+      serverQueue.player.stop();
+      return channel.send("Queue is empty! Stopping playback.");
+    }
+  };
+
+  const onError = async (err) => {
+    console.error("Player error:", err);
+    const tempFile = serverQueue.currentTempFile;
+    serverQueue.currentTempFile = null;
+    safeUnlink(tempFile);
+    await channel.send("An error occurred while playing the song. Skipping...");
+    if (serverQueue.loop !== "single") {
+      serverQueue.queue.shift();
+      serverQueue.nowPlaying = null;
+    }
+    await wait(500);
+    if (serverQueue.queue.length > 0) return playSong(guildId, channel);
+    serverQueue.player.stop();
+  };
+
+  const stateChangeHandler = (oldState, newState) => {
+    if (newState.status === AudioPlayerStatus.Idle) {
+      serverQueue.player.removeListener("stateChange", stateChangeHandler);
+      onIdle().catch(console.error);
+    }
+  };
+  serverQueue.player.on("stateChange", stateChangeHandler);
+
+  const errorHandler = (err) => {
+    serverQueue.player.removeListener("error", errorHandler);
+    onError(err).catch(console.error);
+  };
+  serverQueue.player.on("error", errorHandler);
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-    console.log('📴 Received SIGINT. Shutting down gracefully...');
-    client.destroy();
-    process.exit(0);
-});
+// === Slash Commands ===
+const commands = [
+  new SlashCommandBuilder().setName("join").setDescription("Join the voice channel"),
+  new SlashCommandBuilder().setName("leave").setDescription("Leave the voice channel"),
+  new SlashCommandBuilder()
+    .setName("play")
+    .setDescription("Play a song (YouTube, Spotify track, or search)")
+    .addStringOption((option) =>
+      option.setName("query").setDescription("URL or search term").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("playlist")
+    .setDescription("Add a Spotify playlist")
+    .addStringOption((option) =>
+      option.setName("url").setDescription("Spotify playlist URL").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("loop")
+    .setDescription("Set loop mode")
+    .addStringOption((option) =>
+      option.setName("mode").setDescription("Loop mode").setRequired(true)
+      .addChoices(
+        { name: "off", value: "off" },
+        { name: "single", value: "single" },
+        { name: "queue", value: "queue" }
+      )
+    ),
+  new SlashCommandBuilder().setName("stop").setDescription("Stop playing"),
+  new SlashCommandBuilder().setName("pause").setDescription("Pause playback"),
+  new SlashCommandBuilder().setName("resume").setDescription("Resume playback"),
+  new SlashCommandBuilder().setName("skip").setDescription("Skip to next song"),
+  new SlashCommandBuilder().setName("queue").setDescription("Show current queue"),
+].map((cmd) => cmd.toJSON());
 
-process.on('SIGTERM', () => {
-    console.log('📴 Received SIGTERM. Shutting down gracefully...');
-    client.destroy();
-    process.exit(0);
-});
+// === Deploy Commands ===
+const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
+(async () => {
+  try {
+    console.log("Started refreshing application (/) commands.");
+    const route = process.env.DISCORD_GUILD_ID
+      ? Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID)
+      : Routes.applicationCommands(process.env.DISCORD_CLIENT_ID);
+    await rest.put(route, { body: commands });
+    console.log("Successfully reloaded application (/) commands.");
+  } catch (error) {
+    console.error(`Command deployment error: ${error.message}`);
+  }
+})();
 
-// Start the bot
-startBot().catch((error) => {
-    console.error('❌ Fatal error starting bot:', error);
-    process.exit(1);
-});
+client.login(process.env.DISCORD_BOT_TOKEN);
